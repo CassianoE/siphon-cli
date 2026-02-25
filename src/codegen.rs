@@ -14,6 +14,7 @@ const SKIP_HEADERS: &[&str] = &[
     "accept-encoding",
     "accept-language",
     "connection",
+    "cookie", // managed by requests.Session() / curl cookie jar
     "host",
     "origin",
     "referer",
@@ -46,6 +47,8 @@ struct TemplateExtraction {
     method: String, // "json", "header", "cookie", "html", "regex"
     path: String,
     regex_pattern: Option<String>,
+    /// Bash-safe regex: quotes replaced with \x22/\x27 hex escapes for use in single-quoted strings
+    bash_regex_pattern: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +75,7 @@ struct TemplateRequest {
     injections: Vec<TemplateInjection>,
     has_injections: bool,
     expected_status: u16,
+    is_redirect: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +147,9 @@ fn json_path_to_python(path: &str) -> String {
     result
 }
 
+/// Names reserved by generated scripts (would shadow important variables)
+const RESERVED_VAR_NAMES: &[&str] = &["session", "requests", "re", "json", "os", "sys"];
+
 fn sanitize_var_name(name: &str) -> String {
     let sanitized: String = name
         .chars()
@@ -153,6 +160,8 @@ fn sanitize_var_name(name: &str) -> String {
         "_var".to_string()
     } else if sanitized.as_bytes()[0].is_ascii_digit() {
         format!("_{}", sanitized)
+    } else if RESERVED_VAR_NAMES.contains(&sanitized.as_str()) {
+        format!("{}_value", sanitized)
     } else {
         sanitized
     }
@@ -198,6 +207,17 @@ fn extract_selector_name(selector: &str) -> Option<String> {
     // Parse name="VALUE" or name='VALUE' from CSS selector
     let re = regex::Regex::new(r#"name\s*=\s*["']([^"']+)["']"#).ok()?;
     re.captures(selector).map(|c| c[1].to_string())
+}
+
+/// Convert a Python regex to a bash-safe version by replacing quote characters with hex escapes.
+/// This allows embedding the regex in bash single-quoted strings (python3 -c '...').
+/// Must handle escaped quotes (\' and \") from the original regex pattern first.
+fn regex_to_bash_safe(regex: &str) -> String {
+    regex
+        .replace("\\'", "\\x27") // \' → \x27 (escaped quote sequence, must come first)
+        .replace("\\\"", "\\x22") // \" → \x22 (escaped double quote)
+        .replace('"', "\\x22") // bare " → \x22
+        .replace('\'', "\\x27") // bare ' → \x27
 }
 
 fn regex_pattern_for_extraction(pattern_name: &str, token_name: &str) -> String {
@@ -451,36 +471,49 @@ fn build_template_context(graph: &DependencyGraph, parameters: &[ActionParameter
                             method: "json".to_string(),
                             path: json_path_to_python(p),
                             regex_pattern: None,
+                            bash_regex_pattern: None,
                         },
                         ExtractionMethod::Header(h) => TemplateExtraction {
                             variable_name: var_name,
                             method: "header".to_string(),
                             path: h.clone(),
                             regex_pattern: None,
+                            bash_regex_pattern: None,
                         },
                         ExtractionMethod::Cookie(c) => TemplateExtraction {
                             variable_name: var_name,
                             method: "cookie".to_string(),
                             path: c.clone(),
                             regex_pattern: None,
+                            bash_regex_pattern: None,
                         },
                         ExtractionMethod::HtmlAttribute {
                             selector,
                             attribute,
-                        } => TemplateExtraction {
-                            variable_name: var_name,
-                            method: "html".to_string(),
-                            path: String::new(),
-                            regex_pattern: Some(html_selector_to_regex(selector, attribute)),
+                        } => {
+                            let pattern = html_selector_to_regex(selector, attribute);
+                            let bash_pattern = regex_to_bash_safe(&pattern);
+                            TemplateExtraction {
+                                variable_name: var_name,
+                                method: "html".to_string(),
+                                path: String::new(),
+                                regex_pattern: Some(pattern),
+                                bash_regex_pattern: Some(bash_pattern),
+                            }
                         },
-                        ExtractionMethod::RegexBody(pattern_name) => TemplateExtraction {
-                            variable_name: var_name,
-                            method: "regex".to_string(),
-                            path: String::new(),
-                            regex_pattern: Some(regex_pattern_for_extraction(
+                        ExtractionMethod::RegexBody(pattern_name) => {
+                            let pattern = regex_pattern_for_extraction(
                                 pattern_name,
                                 &e.name,
-                            )),
+                            );
+                            let bash_pattern = regex_to_bash_safe(&pattern);
+                            TemplateExtraction {
+                                variable_name: var_name,
+                                method: "regex".to_string(),
+                                path: String::new(),
+                                regex_pattern: Some(pattern),
+                                bash_regex_pattern: Some(bash_pattern),
+                            }
                         },
                     }
                 })
@@ -504,6 +537,7 @@ fn build_template_context(graph: &DependencyGraph, parameters: &[ActionParameter
                 injections,
                 has_injections,
                 expected_status: node.request.response_status,
+                is_redirect: (300..400).contains(&node.request.response_status),
             }
         })
         .collect();
@@ -746,7 +780,7 @@ mod tests {
         let graph = crate::analyzer::analyze(&[req1, req2]);
         let output = generate_to_string(&graph, &OutputFormat::Python, &[]).unwrap();
 
-        assert!(output.contains("session.cookies.get("));
+        assert!(output.contains("session_value = session.cookies.get("));
     }
 
     #[test]

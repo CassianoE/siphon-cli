@@ -52,7 +52,7 @@ echo "Step {{ req.order + 1 }}: $STATUS_{{ req.order }} {{ req.method }} {{ req.
 {%- elif ext.method == "cookie" %}
 {{ ext.variable_name | upper }}=$(grep "{{ ext.path }}" "$COOKIE_JAR" | awk '{print $NF}')
 {%- elif ext.method == "html" or ext.method == "regex" %}
-{{ ext.variable_name | upper }}=$(echo "$BODY_{{ req.order }}" | python3 -c "import sys,re; m=re.search(r'{{ ext.regex_pattern }}', sys.stdin.read()); print(m.group(1) if m else '')")
+{{ ext.variable_name | upper }}=$(echo "$BODY_{{ req.order }}" | python3 -c 'import sys,re; m=re.search(r"{{ ext.bash_regex_pattern }}", sys.stdin.read()); print(m.group(1) if m else "")')
 {%- endif %}
 echo "  Extracted {{ ext.variable_name }}: ${ {{- ext.variable_name | upper -}} :0:20}..."
 {%- endfor %}

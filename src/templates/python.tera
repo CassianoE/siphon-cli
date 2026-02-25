@@ -46,6 +46,9 @@ response_{{ req.order }} = session.{{ req.method | lower }}(
 {%- if req.headers | length > 0 %}
     headers=headers_{{ req.order }},
 {%- endif %}
+{%- if req.is_redirect %}
+    allow_redirects=False,
+{%- endif %}
     json={{ req.python_body }})
 {%- elif req.has_body %}
 {%- if req.has_injections %}
@@ -61,6 +64,9 @@ response_{{ req.order }} = session.{{ req.method | lower }}(
 {%- if req.headers | length > 0 %}
     headers=headers_{{ req.order }},
 {%- endif %}
+{%- if req.is_redirect %}
+    allow_redirects=False,
+{%- endif %}
     data=body_{{ req.order }})
 {%- else %}
 
@@ -68,6 +74,9 @@ response_{{ req.order }} = session.{{ req.method | lower }}(
     {% if req.has_injections %}f"{{ req.python_url }}"{% else %}"{{ req.url }}"{% endif %}
 {%- if req.headers | length > 0 %},
     headers=headers_{{ req.order }}
+{%- endif %}
+{%- if req.is_redirect %},
+    allow_redirects=False
 {%- endif %})
 {%- endif %}
 

@@ -89,6 +89,68 @@ Options:
   -V, --version            Print version
 ```
 
+## Real-World Example: Login with CSRF Token
+
+Siphon watches you log in, figures out the CSRF token dependency, and generates a script that replays the entire flow autonomously.
+
+```bash
+siphon https://quotes.toscrape.com/login \
+  -a "type:#username={{user:admin}},type:#password={{pass:admin}},submit:form" \
+  -o python -f quotes_login.py --verbose
+```
+
+```
+── Step 5 : Collecting requests ──
+  ✓ Captured 12 requests (3 requests after filtering)
+    GET https://quotes.toscrape.com/login [200] Document
+    POST https://quotes.toscrape.com/login [302] Document [triggered by: submit:form]
+    GET https://quotes.toscrape.com/ [200] Document [triggered by: submit:form]
+── Step 6 : Analyzing dependencies ──
+  ✓ Found 1 dependency across 3 requests
+    0 -> 1 via csrf_token (CsrfToken, Derived)
+```
+
+Generated `quotes_login.py`:
+
+```python
+import re, requests
+
+USER = "admin"
+PASS = "admin"
+
+session = requests.Session()
+
+# Step 1: GET the login page
+response_0 = session.get("https://quotes.toscrape.com/login")
+
+# Siphon auto-detected the CSRF hidden input and extracts it
+_match = re.search(r'name=["\']csrf_token["\'][^>]*value=["\']([^"\']+)["\']', response_0.text)
+csrf_token = _match.group(1) if _match else None
+
+# Step 2: POST with the extracted CSRF token
+response_1 = session.post(
+    "https://quotes.toscrape.com/login",
+    data=f"csrf_token={csrf_token}&username={USER}&password={PASS}",
+    allow_redirects=False)
+
+# Step 3: Follow redirect — logged in
+response_2 = session.get("https://quotes.toscrape.com/")
+```
+
+Running the generated script:
+
+```
+$ python3 quotes_login.py
+Step 1: 200 GET https://quotes.toscrape.com/login
+  Extracted csrf_token: iaqHCxOPufopBTNSrgsM...
+Step 2: 302 POST https://quotes.toscrape.com/login
+Step 3: 200 GET https://quotes.toscrape.com/
+
+Flow complete!
+```
+
+No manual token handling. Siphon figured it out from watching the browser.
+
 ## How It Works
 
 1. Launches headless Chrome via CDP (Chrome DevTools Protocol)

@@ -19,14 +19,16 @@ use chromiumoxide::cdp::browser_protocol::input::{
     MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::network::{
-    EnableParams, EventLoadingFinished, EventRequestWillBeSent, EventResponseReceived,
-    GetResponseBodyParams, RequestId, ResourceType,
+    EnableParams, EventLoadingFinished, EventRequestWillBeSent,
+    EventRequestWillBeSentExtraInfo, EventResponseReceived,
+    EventResponseReceivedExtraInfo, GetResponseBodyParams, RequestId, ResourceType,
 };
 use chromiumoxide::{Browser as CdpBrowser, BrowserConfig, Page};
 use futures::StreamExt;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
+use url::Url;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -62,8 +64,31 @@ pub struct SiphonBrowser {
     _request_listener: JoinHandle<()>,
     _response_listener: JoinHandle<()>,
     _loading_listener: JoinHandle<()>,
+    _extra_info_listener: JoinHandle<()>,
+    _request_extra_info_listener: JoinHandle<()>,
     debug: bool,
     action_request_map: ActionRequestMap,
+}
+
+/// Quote unquoted attribute values in CSS selectors.
+///
+/// CSS attribute selectors like `[value=11:00]` are invalid because the colon
+/// starts a pseudo-class. This function transforms them into `[value="11:00"]`.
+fn fix_css_attribute_values(selector: &str) -> String {
+    // Match `[attr=value]` where value is NOT already quoted
+    let re = regex::Regex::new(r#"\[([^\]=]+)=([^"'\]\[]+)\]"#).unwrap();
+    re.replace_all(selector, |caps: &regex::Captures| {
+        let attr = &caps[1];
+        let val = &caps[2];
+        // Only quote if the value contains characters that break CSS parsing
+        if val.contains(':') || val.contains(' ') || val.contains('+') || val.contains('/')
+            || val.contains('@') || val.contains('.')
+        {
+            format!("[{}=\"{}\"]", attr, val)
+        } else {
+            caps[0].to_string()
+        }
+    }).to_string()
 }
 
 /// Escape a string for safe use inside a JS single-quoted string literal
@@ -201,7 +226,13 @@ impl SiphonBrowser {
                             }
                             original.loading_finished = true;
                             original.is_redirect_preserved = true;
-                            let redirect_id = format!("{}_redirected", req_id);
+                            // Use a counter suffix to avoid overwriting earlier
+                            // redirects in the same chain (CDP reuses request_id).
+                            let n = store_lock
+                                .keys()
+                                .filter(|k| k.starts_with(&req_id) && k.contains("_redirected"))
+                                .count();
+                            let redirect_id = format!("{}_redirected_{}", req_id, n);
                             if dbg {
                                 eprintln!(
                                     "    [cdp] Redirect: preserving {} {} as {}",
@@ -298,6 +329,80 @@ impl SiphonBrowser {
             })
         };
 
+        // Listen for response extra info events — captures raw headers including Set-Cookie
+        let extra_info_listener = {
+            let store = request_store.clone();
+            let mut events = page.event_listener::<EventResponseReceivedExtraInfo>().await?;
+            tokio::spawn(async move {
+                while let Some(event) = events.next().await {
+                    let req_id = event.request_id.inner().to_string();
+                    let mut store_lock = store.lock().await;
+                    // Try the live request_id first, then check redirect-preserved entries
+                    let pending = store_lock.get_mut(&req_id);
+                    if let Some(pending) = pending {
+                        // Merge raw headers — these include Set-Cookie which
+                        // Network.responseReceived strips out.
+                        // Only add headers not already present (case-insensitive)
+                        // to avoid duplicates like "Content-Type" vs "content-type".
+                        if let Some(obj) = event.headers.inner().as_object() {
+                            let lower_keys: Vec<String> = pending
+                                .response_headers
+                                .keys()
+                                .map(|k| k.to_lowercase())
+                                .collect();
+                            for (k, v) in obj {
+                                if let Some(val) = v.as_str() {
+                                    if !lower_keys.contains(&k.to_lowercase()) {
+                                        pending
+                                            .response_headers
+                                            .insert(k.to_string(), val.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        // Listen for request extra info events — captures raw request headers
+        // including Cookie which Network.requestWillBeSent strips out.
+        let request_extra_info_listener = {
+            let store = request_store.clone();
+            let mut events = page.event_listener::<EventRequestWillBeSentExtraInfo>().await?;
+            tokio::spawn(async move {
+                while let Some(event) = events.next().await {
+                    let req_id = event.request_id.inner().to_string();
+                    let mut store_lock = store.lock().await;
+                    if let Some(pending) = store_lock.get_mut(&req_id) {
+                        if let Some(obj) = event.headers.inner().as_object() {
+                            // Case-insensitive check to avoid duplicates like
+                            // "User-Agent" (requestWillBeSent) vs "user-agent" (ExtraInfo)
+                            let lower_keys: Vec<String> = pending
+                                .headers
+                                .keys()
+                                .map(|k| k.to_lowercase())
+                                .collect();
+                            for (k, v) in obj {
+                                // Skip HTTP/2 pseudo-headers (e.g. :method, :path)
+                                if k.starts_with(':') {
+                                    continue;
+                                }
+                                if let Some(val) = v.as_str() {
+                                    // Only merge headers not already present (case-insensitive) —
+                                    // the original headers from requestWillBeSent
+                                    // should take priority for non-cookie headers.
+                                    if !lower_keys.contains(&k.to_lowercase()) {
+                                        pending.headers.insert(k.to_string(), val.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
         Ok(Self {
             browser,
             page,
@@ -306,6 +411,8 @@ impl SiphonBrowser {
             _request_listener: req_listener,
             _response_listener: resp_listener,
             _loading_listener: loading_listener,
+            _extra_info_listener: extra_info_listener,
+            _request_extra_info_listener: request_extra_info_listener,
             debug,
             action_request_map: Arc::new(Mutex::new(Vec::new())),
         })
@@ -355,7 +462,9 @@ impl SiphonBrowser {
     }
 
     async fn execute_action(&self, action: &Action) -> Result<(), Box<dyn std::error::Error>> {
-        let selector = action.selector.as_deref().unwrap_or("");
+        let raw_selector = action.selector.as_deref().unwrap_or("");
+        // Fix unquoted attribute values (e.g. [value=11:00] → [value="11:00"])
+        let selector = &fix_css_attribute_values(raw_selector);
 
         match action.action_type {
             ActionType::Click => {
@@ -371,6 +480,8 @@ impl SiphonBrowser {
                         .click()
                         .await?;
                 }
+                // Wait briefly for potential navigation triggered by the click
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
             ActionType::Type => {
                 let value = action.value.as_deref().unwrap_or("");
@@ -391,11 +502,22 @@ impl SiphonBrowser {
                 if self.debug {
                     eprintln!("    [action] Navigate to {}", selector);
                 }
-                self.page
-                    .goto(selector)
-                    .await?
-                    .wait_for_navigation()
-                    .await?;
+                // Navigation to error pages (4xx/5xx) triggers
+                // net::ERR_HTTP_RESPONSE_CODE_FAILURE in Chrome.
+                // The request is still captured by CDP listeners, so we
+                // warn instead of failing — the user wants the traffic, not
+                // a successful page load.
+                match self.page.goto(selector).await {
+                    Ok(nav) => { let _ = nav.wait_for_navigation().await; }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("ERR_") || msg.contains("net::") {
+                            eprintln!("  ⚠ Navigation to {} returned an error page ({}), continuing capture", selector, msg);
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+                }
             }
             ActionType::Wait => {
                 let ms: u64 = selector.parse().unwrap_or(1000);
@@ -489,6 +611,7 @@ impl SiphonBrowser {
             r#"(() => {{
                 const el = document.querySelector('{}');
                 if (!el) return null;
+                el.scrollIntoView({{ block: 'center', behavior: 'instant' }});
                 const rect = el.getBoundingClientRect();
                 return {{ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }};
             }})()"#,
@@ -675,6 +798,15 @@ impl SiphonBrowser {
 
     /// Collect requests captured by JS hooks (fetch/XHR interception)
     async fn collect_js_requests(&self) -> Vec<CapturedRequest> {
+        // Get current page URL for resolving relative URLs
+        let page_url = self
+            .page
+            .evaluate("window.location.href")
+            .await
+            .ok()
+            .and_then(|v| v.into_value::<String>().ok());
+        let base_url = page_url.as_deref().and_then(|u| Url::parse(u).ok());
+
         let result = self.page.evaluate(hooks::COLLECT_SCRIPT).await;
 
         let json_str = match result {
@@ -693,7 +825,17 @@ impl SiphonBrowser {
         let mut requests = Vec::new();
         for (i, entry) in js_entries.iter().enumerate() {
             let method = entry["method"].as_str().unwrap_or("GET").to_string();
-            let url_str = entry["url"].as_str().unwrap_or("").to_string();
+            let raw_url = entry["url"].as_str().unwrap_or("").to_string();
+            // Resolve relative URLs against the page's base URL
+            let url_str = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+                raw_url
+            } else if let Some(ref base) = base_url {
+                base.join(&raw_url)
+                    .map(|u| u.to_string())
+                    .unwrap_or(raw_url)
+            } else {
+                raw_url
+            };
             let body = entry["body"].as_str().map(|s| s.to_string());
             let timestamp = entry["timestamp"].as_u64().unwrap_or(0);
             let response_status = entry["responseStatus"].as_u64().unwrap_or(0) as u16;
@@ -740,7 +882,82 @@ impl SiphonBrowser {
         self._request_listener.abort();
         self._response_listener.abort();
         self._loading_listener.abort();
+        self._extra_info_listener.abort();
+        self._request_extra_info_listener.abort();
         self._handler_handle.abort();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fix_css_colon_in_value() {
+        assert_eq!(
+            fix_css_attribute_values("input[name=delivery][value=11:00]"),
+            r#"input[name=delivery][value="11:00"]"#
+        );
+    }
+
+    #[test]
+    fn test_fix_css_no_change_simple() {
+        assert_eq!(
+            fix_css_attribute_values("input[name=size][value=large]"),
+            "input[name=size][value=large]"
+        );
+    }
+
+    #[test]
+    fn test_fix_css_already_quoted() {
+        assert_eq!(
+            fix_css_attribute_values(r#"input[value="11:00"]"#),
+            r#"input[value="11:00"]"#
+        );
+    }
+
+    #[test]
+    fn test_fix_css_email_value() {
+        assert_eq!(
+            fix_css_attribute_values("input[value=test@example.com]"),
+            r#"input[value="test@example.com"]"#
+        );
+    }
+
+    #[test]
+    fn test_fix_css_space_in_value() {
+        assert_eq!(
+            fix_css_attribute_values("input[value=hello world]"),
+            r#"input[value="hello world"]"#
+        );
+    }
+
+    #[test]
+    fn test_fix_css_no_attribute_selector() {
+        assert_eq!(
+            fix_css_attribute_values("div.class > span"),
+            "div.class > span"
+        );
+    }
+
+    #[test]
+    fn test_escape_js_basic() {
+        assert_eq!(escape_js_string("hello"), "hello");
+    }
+
+    #[test]
+    fn test_escape_js_quotes() {
+        assert_eq!(escape_js_string("it's"), "it\\'s");
+    }
+
+    #[test]
+    fn test_escape_js_backslash() {
+        assert_eq!(escape_js_string("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn test_escape_js_newline() {
+        assert_eq!(escape_js_string("a\nb"), "a\\nb");
     }
 }
