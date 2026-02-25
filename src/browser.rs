@@ -44,6 +44,10 @@ struct PendingRequest {
     response_status: Option<u16>,
     response_headers: HashMap<String, String>,
     loading_finished: bool,
+    /// Response body fetched eagerly on LoadingFinished to prevent Chrome discarding it
+    response_body: Option<String>,
+    /// True for entries preserved from redirect (their request_id was reused by the target)
+    is_redirect_preserved: bool,
 }
 
 /// Shared state between event listeners
@@ -165,6 +169,8 @@ impl SiphonBrowser {
                         response_status: None,
                         response_headers: HashMap::new(),
                         loading_finished: false,
+                        response_body: None,
+                        is_redirect_preserved: false,
                     };
 
                     if dbg {
@@ -174,7 +180,39 @@ impl SiphonBrowser {
                         );
                     }
 
-                    store.lock().await.insert(req_id, pending);
+                    let mut store_lock = store.lock().await;
+
+                    // Handle redirect: preserve the original request before it's overwritten
+                    // CDP reuses the same request_id for redirect chains, so the new
+                    // EventRequestWillBeSent (for the redirect target) would overwrite the
+                    // original request (e.g. a POST with form data). We save it under a
+                    // unique "{id}_redirected" key with status/headers from the redirect response.
+                    if let Some(ref redirect_resp) = event.redirect_response {
+                        if let Some(mut original) = store_lock.remove(&req_id) {
+                            original.response_status = Some(redirect_resp.status as u16);
+                            if let Some(obj) = redirect_resp.headers.inner().as_object() {
+                                for (k, v) in obj {
+                                    if let Some(val) = v.as_str() {
+                                        original
+                                            .response_headers
+                                            .insert(k.to_string(), val.to_string());
+                                    }
+                                }
+                            }
+                            original.loading_finished = true;
+                            original.is_redirect_preserved = true;
+                            let redirect_id = format!("{}_redirected", req_id);
+                            if dbg {
+                                eprintln!(
+                                    "    [cdp] Redirect: preserving {} {} as {}",
+                                    original.method, original.url, redirect_id
+                                );
+                            }
+                            store_lock.insert(redirect_id, original);
+                        }
+                    }
+
+                    store_lock.insert(req_id, pending);
                 }
             })
         };
@@ -203,16 +241,58 @@ impl SiphonBrowser {
             })
         };
 
-        // Listen for loading finished events
+        // Listen for loading finished events — eagerly fetch response bodies
+        // so Chrome doesn't discard them before collect_requests runs.
         let loading_listener = {
             let store = request_store.clone();
+            let page_clone = page.clone();
+            let dbg = debug;
             let mut events = page.event_listener::<EventLoadingFinished>().await?;
             tokio::spawn(async move {
                 while let Some(event) = events.next().await {
                     let req_id = event.request_id.inner().to_string();
-                    let mut store = store.lock().await;
-                    if let Some(pending) = store.get_mut(&req_id) {
-                        pending.loading_finished = true;
+
+                    // Mark as finished
+                    {
+                        let mut store_lock = store.lock().await;
+                        if let Some(pending) = store_lock.get_mut(&req_id) {
+                            pending.loading_finished = true;
+                        }
+                    }
+
+                    // Eagerly fetch response body (outside lock to avoid blocking)
+                    let params = GetResponseBodyParams::new(RequestId::from(req_id.clone()));
+                    let body = match page_clone.execute(params).await {
+                        Ok(response) => {
+                            let b = &response.result.body;
+                            if b.is_empty() {
+                                None
+                            } else if response.result.base64_encoded {
+                                BASE64_STANDARD
+                                    .decode(b)
+                                    .ok()
+                                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                            } else {
+                                Some(b.clone())
+                            }
+                        }
+                        Err(e) => {
+                            if dbg {
+                                eprintln!(
+                                    "    [cdp] Eager body fetch failed for {}: {}",
+                                    req_id, e
+                                );
+                            }
+                            None
+                        }
+                    };
+
+                    // Cache body in the pending request
+                    if body.is_some() {
+                        let mut store_lock = store.lock().await;
+                        if let Some(pending) = store_lock.get_mut(&req_id) {
+                            pending.response_body = body;
+                        }
                     }
                 }
             })
@@ -505,9 +585,15 @@ impl SiphonBrowser {
         });
 
         for pending in entries {
-            // Try to get response body for completed requests
-            let response_body = if pending.loading_finished {
-                self.get_response_body(&pending.request_id).await
+            // Use eagerly-cached body first (fetched in EventLoadingFinished handler).
+            // Fall back to live fetch only for non-redirect entries that have a response
+            // but missed the eager fetch. Skip redirect-preserved entries because their
+            // request_id was reused by the redirect target — getResponseBody would
+            // return the wrong body.
+            let response_body = if pending.response_body.is_some() {
+                pending.response_body.clone()
+            } else if pending.response_status.is_some() && !pending.is_redirect_preserved {
+                self.get_response_body(&pending.request_id, self.debug).await
             } else {
                 None
             };
@@ -560,7 +646,7 @@ impl SiphonBrowser {
     }
 
     /// Get response body for a request via CDP
-    async fn get_response_body(&self, request_id: &str) -> Option<String> {
+    async fn get_response_body(&self, request_id: &str, debug: bool) -> Option<String> {
         let params = GetResponseBodyParams::new(RequestId::from(request_id.to_string()));
         match self.page.execute(params).await {
             Ok(response) => {
@@ -578,7 +664,12 @@ impl SiphonBrowser {
                     Some(body.clone())
                 }
             }
-            Err(_) => None,
+            Err(e) => {
+                if debug {
+                    eprintln!("    [cdp] Failed to get body for {}: {}", request_id, e);
+                }
+                None
+            }
         }
     }
 
