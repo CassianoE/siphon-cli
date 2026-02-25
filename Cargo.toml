@@ -1,0 +1,24 @@
+[package]
+name = "siphon"
+version = "0.1.0"
+edition = "2021"
+description = "Automatic API flow extractor & replay script generator"
+license = "MIT"
+repository = "https://github.com/user/siphon"
+keywords = ["http", "reverse-engineering", "browser", "automation", "api"]
+categories = ["command-line-utilities", "web-programming"]
+
+[dependencies]
+chromiumoxide = "0.9"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tera = "1"
+shannon-entropy = "1"
+colored = "2"
+regex = "1"
+url = "2"
+futures = "0.3"
+base64 = "0.22"
+rand = "0.8"
