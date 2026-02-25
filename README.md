@@ -13,7 +13,7 @@ cargo install siphon
 Or build from source:
 
 ```bash
-git clone https://github.com/your-user/siphon.git
+git clone https://github.com/CassianoE/siphon-cli.git
 cd siphon
 cargo build --release
 ```

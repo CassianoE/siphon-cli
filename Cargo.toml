@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Automatic API flow extractor & replay script generator"
 license = "MIT"
-repository = "https://github.com/user/siphon"
+repository = "https://github.com/CassianoE/siphon-cli"
 keywords = ["http", "reverse-engineering", "browser", "automation", "api"]
 categories = ["command-line-utilities", "web-programming"]
 
