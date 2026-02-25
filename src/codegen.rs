@@ -167,8 +167,79 @@ fn sanitize_var_name(name: &str) -> String {
     }
 }
 
+/// Escape double quotes in header values for safe embedding in Python strings
+fn escape_double_quotes(s: &str) -> String {
+    s.replace('"', "\\\"")
+}
+
 fn escape_python_body(body: &str) -> String {
     body.replace('\\', "\\\\").replace("\"\"\"", "\\\"\\\"\\\"")
+}
+
+/// Convert JavaScript boolean/null literals to Python equivalents in a JSON body.
+/// Only replaces standalone values (not inside strings) by doing a serde round-trip.
+fn js_to_python_json(body: &str) -> String {
+    // Parse and re-serialize to normalize, then do targeted replacements
+    // on the serialized output where booleans/nulls are always unquoted.
+    match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(val) => {
+            // serde_json serializes to true/false/null — convert to Python
+            let s = serde_json::to_string(&val).unwrap_or_else(|_| body.to_string());
+            python_literal_replace(&s)
+        }
+        Err(_) => body.to_string(),
+    }
+}
+
+/// Replace JSON true/false/null with Python True/False/None in a serialized JSON string.
+/// Safe because serde_json output never has these as string content without escaping.
+fn python_literal_replace(s: &str) -> String {
+    // We need context-aware replacement: only replace when not inside a string.
+    let mut result = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if escape {
+            result.push(chars[i]);
+            escape = false;
+            i += 1;
+            continue;
+        }
+        if chars[i] == '\\' && in_string {
+            result.push(chars[i]);
+            escape = true;
+            i += 1;
+            continue;
+        }
+        if chars[i] == '"' {
+            in_string = !in_string;
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if in_string {
+            result.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // Outside string — check for true/false/null
+        if s[i..].starts_with("true") && (i + 4 >= chars.len() || !chars[i + 4].is_alphanumeric()) {
+            result.push_str("True");
+            i += 4;
+        } else if s[i..].starts_with("false") && (i + 5 >= chars.len() || !chars[i + 5].is_alphanumeric()) {
+            result.push_str("False");
+            i += 5;
+        } else if s[i..].starts_with("null") && (i + 4 >= chars.len() || !chars[i + 4].is_alphanumeric()) {
+            result.push_str("None");
+            i += 4;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+    result
 }
 
 fn escape_curl_body(body: &str) -> String {
@@ -335,14 +406,14 @@ fn build_template_context(graph: &DependencyGraph, parameters: &[ActionParameter
 
                     if let Some((_, _, var_name, token_value)) = injection {
                         let python_value =
-                            value.replace(token_value.as_str(), &format!("{{{}}}", var_name));
-                        let curl_value = value.replace(
+                            escape_double_quotes(&value.replace(token_value.as_str(), &format!("{{{}}}", var_name)));
+                        let curl_value = escape_double_quotes(&value.replace(
                             token_value.as_str(),
                             &format!("${}", var_name.to_uppercase()),
-                        );
+                        ));
                         TemplateHeader {
                             name: name.clone(),
-                            value: value.clone(),
+                            value: escape_double_quotes(value),
                             is_dynamic: true,
                             python_value,
                             curl_value,
@@ -350,10 +421,10 @@ fn build_template_context(graph: &DependencyGraph, parameters: &[ActionParameter
                     } else {
                         TemplateHeader {
                             name: name.clone(),
-                            value: value.clone(),
+                            value: escape_double_quotes(value),
                             is_dynamic: false,
-                            python_value: value.clone(),
-                            curl_value: value.clone(),
+                            python_value: escape_double_quotes(value),
+                            curl_value: escape_double_quotes(value),
                         }
                     }
                 })
@@ -447,7 +518,12 @@ fn build_template_context(graph: &DependencyGraph, parameters: &[ActionParameter
                 }
 
                 // Apply escaping after injection placeholder insertion
-                let py_body = escape_python_body(&py_body);
+                let py_body = if body_is_json {
+                    // Convert JS true/false/null to Python True/False/None
+                    js_to_python_json(&py_body)
+                } else {
+                    escape_python_body(&py_body)
+                };
                 let cu_body = if body_has_variables {
                     escape_curl_body_double_quoted(&cu_body)
                 } else {
@@ -638,6 +714,23 @@ mod tests {
         let input = "it's a test";
         let escaped = escape_curl_body(input);
         assert_eq!(escaped, "it'\\''s a test");
+    }
+
+    #[test]
+    fn test_header_value_escaping() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "X-Custom".to_string(),
+            r#""Not:A-Brand";v="99", "Chromium";v="145""#.to_string(),
+        );
+        let req = make_request(0, "GET", "https://example.com", headers, None, 200, HashMap::new(), None);
+        let graph = crate::analyzer::analyze(&[req]);
+        let py = generate_to_string(&graph, &OutputFormat::Python, &[]).unwrap();
+        let curl = generate_to_string(&graph, &OutputFormat::Curl, &[]).unwrap();
+        // Python: quotes should be escaped
+        assert!(py.contains(r#"\"Not:A-Brand\""#), "Python header value should escape double quotes");
+        // Curl: quotes should be escaped
+        assert!(curl.contains(r#"\"Not:A-Brand\""#), "Curl header value should escape double quotes");
     }
 
     #[test]
@@ -991,6 +1084,51 @@ mod tests {
     fn test_is_json_body_by_header() {
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         assert!(is_json_body("not valid json", &headers));
+    }
+
+    #[test]
+    fn test_python_json_body_booleans() {
+        let req = make_request(
+            0,
+            "POST",
+            "https://example.com/api",
+            HashMap::new(),
+            Some(r#"{"enabled": true, "debug": false, "value": null, "name": "true"}"#.to_string()),
+            200,
+            HashMap::new(),
+            None,
+        );
+        let graph = crate::analyzer::analyze(&[req]);
+        let output = generate_to_string(&graph, &OutputFormat::Python, &[]).unwrap();
+
+        // JS true/false/null should become Python True/False/None
+        assert!(output.contains("True"), "should contain Python True");
+        assert!(output.contains("False"), "should contain Python False");
+        assert!(output.contains("None"), "should contain Python None");
+        // "true" inside a string value should NOT be replaced
+        assert!(output.contains(r#""true""#), "string 'true' should be preserved");
+    }
+
+    #[test]
+    fn test_js_to_python_json() {
+        let input = r#"{"a": true, "b": false, "c": null, "d": "true"}"#;
+        let output = js_to_python_json(input);
+        assert!(output.contains("True"));
+        assert!(output.contains("False"));
+        assert!(output.contains("None"));
+        assert!(output.contains(r#""true""#));
+    }
+
+    #[test]
+    fn test_python_literal_replace() {
+        assert_eq!(python_literal_replace("true"), "True");
+        assert_eq!(python_literal_replace("false"), "False");
+        assert_eq!(python_literal_replace("null"), "None");
+        assert_eq!(python_literal_replace(r#""true""#), r#""true""#);
+        assert_eq!(
+            python_literal_replace(r#"{"a":true,"b":false,"c":null}"#),
+            r#"{"a":True,"b":False,"c":None}"#
+        );
     }
 
     #[test]

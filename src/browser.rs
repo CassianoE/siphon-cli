@@ -824,7 +824,7 @@ impl SiphonBrowser {
 
         let mut requests = Vec::new();
         for (i, entry) in js_entries.iter().enumerate() {
-            let method = entry["method"].as_str().unwrap_or("GET").to_string();
+            let method = entry["method"].as_str().unwrap_or("GET").to_uppercase();
             let raw_url = entry["url"].as_str().unwrap_or("").to_string();
             // Resolve relative URLs against the page's base URL
             let url_str = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
